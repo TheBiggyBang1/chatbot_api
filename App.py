@@ -1,8 +1,9 @@
-# App.py — FastAPI backend only
+# App.py
 
 import os
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
+from typing import List
 
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.security import HTTPBearer
@@ -10,7 +11,7 @@ from pydantic import BaseModel, Field
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from langchain_groq import ChatGroq
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
 # ── ENV ───────────────────────────────────────────────────────────────────────
 load_dotenv()
@@ -19,6 +20,7 @@ SECRET_KEY = os.getenv("SECRET_KEY", "change-this-in-production-long-random-stri
 ALGORITHM = "HS256"
 TOKEN_EXPIRE_MIN = 30
 MODEL = "llama-3.3-70b-versatile"
+SYSTEM_PROMPT = "You are a helpful AI assistant."
 
 # ── AUTH SETUP ────────────────────────────────────────────────────────────────
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -48,11 +50,27 @@ VALID_API_KEYS: dict[str, str] = {
 }
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
+class Message(BaseModel):
+    role: str        # "user" or "assistant"
+    content: str
+
 class ChatRequest(BaseModel):
     question: str = Field(..., min_length=1)
-    system_prompt: str = "You are a helpful AI assistant."
+    system_prompt: str = SYSTEM_PROMPT
 
 class ChatResponse(BaseModel):
+    answer: str
+    model: str
+    tokens_used: int
+    authenticated_as: str
+
+class ConversationRequest(BaseModel):
+    messages: List[Message]
+    system_prompt: str = SYSTEM_PROMPT
+    temperature: float = 0.7
+    max_tokens: int = 512
+
+class ConversationResponse(BaseModel):
     answer: str
     model: str
     tokens_used: int
@@ -91,6 +109,8 @@ def require_jwt(credentials=Depends(bearer_scheme)) -> dict:
 async def ping():
     return {"status": "ok", "message": "Groq API is running."}
 
+
+# Single-turn chat — API key protected
 @app.post("/chat", response_model=ChatResponse, tags=["AI — Protected"])
 async def chat(req: ChatRequest, username: str = Depends(require_api_key)):
     messages = [
@@ -106,12 +126,43 @@ async def chat(req: ChatRequest, username: str = Depends(require_api_key)):
         authenticated_as=username,
     )
 
+
+# Multi-turn conversation — API key protected (chatbot.py logic)
+@app.post("/conversation", response_model=ConversationResponse, tags=["AI — Protected"])
+async def conversation(req: ConversationRequest, username: str = Depends(require_api_key)):
+    llm = ChatGroq(
+        model=MODEL,
+        temperature=req.temperature,
+        max_tokens=req.max_tokens,
+        api_key=GROQ_API_KEY
+    )
+
+    # Build full message history exactly like chatbot.py did
+    lc_messages = [SystemMessage(content=req.system_prompt)]
+    for msg in req.messages:
+        if msg.role == "user":
+            lc_messages.append(HumanMessage(content=msg.content))
+        elif msg.role == "assistant":
+            lc_messages.append(AIMessage(content=msg.content))
+
+    response = llm.invoke(lc_messages)
+    usage = response.usage_metadata or {}
+    return ConversationResponse(
+        answer=response.content,
+        model=MODEL,
+        tokens_used=usage.get("total_tokens", 0),
+        authenticated_as=username,
+    )
+
+
+# Auth routes
 @app.post("/auth/register", status_code=201, tags=["Auth"])
 async def register(req: AuthRequest):
     if req.username in users_db:
         raise HTTPException(status_code=409, detail="Username already taken.")
     users_db[req.username] = {"hashed_password": pwd_ctx.hash(req.password)}
     return {"message": f"User {req.username!r} created."}
+
 
 @app.post("/auth/login", tags=["Auth"])
 async def login(req: AuthRequest):
@@ -121,6 +172,8 @@ async def login(req: AuthRequest):
     token = create_token({"sub": req.username})
     return {"access_token": token, "token_type": "bearer"}
 
+
+# Single-turn chat — JWT protected
 @app.post("/chat2", response_model=ChatResponse, tags=["AI — Protected"])
 async def chat2(req: ChatRequest, payload: dict = Depends(require_jwt)):
     username = payload["sub"]
@@ -131,6 +184,34 @@ async def chat2(req: ChatRequest, payload: dict = Depends(require_jwt)):
     response = groq_llm.invoke(messages)
     usage = response.usage_metadata or {}
     return ChatResponse(
+        answer=response.content,
+        model=MODEL,
+        tokens_used=usage.get("total_tokens", 0),
+        authenticated_as=username,
+    )
+
+
+# Multi-turn conversation — JWT protected (chatbot.py logic)
+@app.post("/conversation2", response_model=ConversationResponse, tags=["AI — Protected"])
+async def conversation2(req: ConversationRequest, payload: dict = Depends(require_jwt)):
+    username = payload["sub"]
+    llm = ChatGroq(
+        model=MODEL,
+        temperature=req.temperature,
+        max_tokens=req.max_tokens,
+        api_key=GROQ_API_KEY
+    )
+
+    lc_messages = [SystemMessage(content=req.system_prompt)]
+    for msg in req.messages:
+        if msg.role == "user":
+            lc_messages.append(HumanMessage(content=msg.content))
+        elif msg.role == "assistant":
+            lc_messages.append(AIMessage(content=msg.content))
+
+    response = llm.invoke(lc_messages)
+    usage = response.usage_metadata or {}
+    return ConversationResponse(
         answer=response.content,
         model=MODEL,
         tokens_used=usage.get("total_tokens", 0),
