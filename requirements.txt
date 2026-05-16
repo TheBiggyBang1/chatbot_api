@@ -1,0 +1,9 @@
+streamlit
+fastapi
+uvicorn
+langchain-groq
+langchain-core
+python-dotenv
+pydantic
+python-jose[cryptography]
+passlib[bcrypt]
